@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  用户表自定义 SQL。
+  索引对齐：后台列表按 (create_time, id) 倒序翻页，与 idx_create_time(create_time, id) 完全对齐；
+  status 是低区分度列（绝大多数为 1），不单独建索引，按状态过滤时由 idx_create_time 范围扫描 + 回表判断。
+-->
+<mapper namespace="com.linnea.lingxi.mapper.UserMapper">
+
+    <!--
+      后台用户列表（键集分页）。
+      只取展示与判定需要的列，不查 password_hash / api_key：敏感列不进内存，也就不可能误进日志或响应。
+      关键字用「前缀匹配」而不是 %keyword%：前后置通配符会让索引完全失效，前缀匹配至少保留范围扫描。
+    -->
+    <select id="selectAdminUserList" resultType="com.linnea.lingxi.entity.User">
+        SELECT
+            u.id,
+            u.username,
+            u.nickname,
+            COALESCE(u.avatar_url, '') AS avatar_url,
+            u.role,
+            u.status,
+            COALESCE(u.ban_reason, '') AS ban_reason,
+            u.create_time
+        FROM `user` u
+        <where>
+            u.is_deleted = 0
+            <if test="keyword != null and keyword != ''">
+                AND (u.username LIKE CONCAT(#{keyword}, '%') OR u.nickname LIKE CONCAT(#{keyword}, '%'))
+            </if>
+            <if test="status != null">
+                AND u.status = #{status}
+            </if>
+            <if test="cursorCreateTime != null and cursorId != null">
+                AND (
+                    u.create_time &lt; #{cursorCreateTime}
+                    OR (u.create_time = #{cursorCreateTime} AND u.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY u.create_time DESC, u.id DESC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

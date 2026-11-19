@@ -1,0 +1,129 @@
+# Lingxi 本地编排：MySQL + Redis（默认），应用容器按需用 profile 拉起
+#
+# 表结构不由本文件管理：应用启动时 Flyway 按 db/migration 的版本号自动迁移
+# （空库从 V1 全量建，存量库 baseline 到 V3 后只跑 V4+），故 mysql 服务只建空库，
+# 也不再挂 docker-entrypoint-initdb.d——那条路只在空卷首次启动生效，存量卷永远补不到。
+#
+# 常用命令：
+#   1) 只起依赖（默认行为，Spring Boot 的 docker-compose 支持也只拉这两个）：
+#        docker compose up -d
+#   2) 全栈容器化（应用一起进容器，迁移随应用启动执行）：
+#        docker compose --profile app up -d --build
+#
+# 敏感值不在本文件：从同目录 .env 读取（模板 .env.example，.env 已在 .gitignore）。
+# 用 ${VAR:?提示} 形式，缺失时 compose 直接报错退出，避免「以为改了密码，其实跑的是默认值」。
+name: lingxi
+
+# 日志轮转：默认 json-file 不轮转会吃满磁盘，dev 机器上尤其容易忽略
+x-logging: &default-logging
+  driver: 'json-file'
+  options:
+    max-size: '20m'
+    max-file: '3'
+
+services:
+  mysql:
+    image: 'mysql:8.4'
+    container_name: 'lingxi_mysql'
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: '${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD（参考 .env.example）}'
+      # 只建空库：表结构由应用启动时的 Flyway 建（见 application.properties 的 spring.flyway.*）
+      MYSQL_DATABASE: 'lingxi'
+      TZ: 'Asia/Shanghai'
+    command:
+      - '--character-set-server=utf8mb4'
+      - '--collation-server=utf8mb4_0900_ai_ci'
+      - '--default-time-zone=+08:00'
+    ports:
+      # 只绑回环地址：数据库不该暴露给局域网/公网
+      - '127.0.0.1:${MYSQL_PORT:-3306}:3306'
+    volumes:
+      # 只挂数据目录：建表与变更全部交给应用启动时的 Flyway（classpath:db/migration），
+      # 这样空库、存量库走同一条迁移路径，不存在「initdb 只在空卷跑一次」的盲区。
+      - 'lingxi-mysql-data:/var/lib/mysql'
+    healthcheck:
+      # 用 MYSQL_PWD 传密码：mysqladmin -p<密码> 会把密码暴露在进程列表与容器日志里
+      test: [ 'CMD-SHELL', 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -uroot --silent' ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  redis:
+    image: 'redis:8.8.4'
+    container_name: 'lingxi_redis'
+    restart: unless-stopped
+    environment:
+      # 密码只经环境变量进容器，再交给 redis-server 与 healthcheck 使用
+      REDIS_PASSWORD: '${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（参考 .env.example）}'
+      TZ: 'Asia/Shanghai'
+    # noeviction 是安全底线：本 Redis 存的是幂等键与「已吊销令牌」标记，
+    # 一旦被 LRU 淘汰，已登出的令牌会重新可用、重复提交会穿透幂等栅栏。
+    # 代价是内存写满后写入失败（不静默丢数据），故这里不设 maxmemory，交给宿主机内存约束。
+    command:
+      - 'sh'
+      - '-c'
+      - 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction'
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+    volumes:
+      - 'lingxi-redis-data:/data'
+    healthcheck:
+      # REDISCLI_AUTH 代替 -a：-a 会把密码写进进程列表与日志
+      test: [ 'CMD-SHELL', 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG' ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # 应用容器：profile=app，默认不随 `docker compose up` 启动（避免和本机 IDE 里的应用抢 18080）
+  app:
+    profiles: [ 'app' ]
+    build:
+      context: '.'
+      dockerfile: 'Dockerfile'
+      args:
+        # 基础镜像可替换（内网/离线环境改成自建仓库地址）
+        BUILD_IMAGE: '${BUILD_IMAGE:-eclipse-temurin:25-jdk}'
+        RUNTIME_IMAGE: '${RUNTIME_IMAGE:-eclipse-temurin:25-jre}'
+    image: 'lingxi-app:local'
+    container_name: 'lingxi_app'
+    restart: unless-stopped
+    depends_on:
+      # 等健康检查通过再启动：MySQL 首次初始化要几十秒，起来太早应用会因连不上库而退出
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: 'Asia/Shanghai'
+      # 密钥不落镜像、不落 compose 文件，只在运行时注入
+      JWT_SECRET: '${JWT_SECRET:?请在 .env 中设置 JWT_SECRET（Base64 编码 ≥256bit，参考 .env.example）}'
+      # 容器内主机名是服务名 mysql/redis，必须覆盖 application.properties 里的 localhost
+      SPRING_DATASOURCE_URL: 'jdbc:mysql://mysql:3306/lingxi?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai'
+      SPRING_DATASOURCE_USERNAME: 'root'
+      SPRING_DATASOURCE_PASSWORD: '${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD（参考 .env.example）}'
+      SPRING_DATA_REDIS_HOST: 'redis'
+      SPRING_DATA_REDIS_PORT: '6379'
+      SPRING_DATA_REDIS_PASSWORD: '${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（参考 .env.example）}'
+      SERVER_PORT: '18080'
+      SPRINGDOC_ENABLED: '${SPRINGDOC_ENABLED:-true}'
+      # 与镜像内的目录一致；容器重建后历史日志仍在（docker logs 只保留当前容器的输出）
+      LOG_PATH: '/app/logs'
+    ports:
+      - '127.0.0.1:${APP_PORT:-18080}:18080'
+    volumes:
+      - 'lingxi-app-logs:/app/logs'
+    logging: *default-logging
+
+volumes:
+  # 【不要给这两个卷写显式 name】实际卷名会带项目前缀，即 lingxi_lingxi-mysql-data / lingxi_lingxi-redis-data，
+  # 与现有数据卷完全一致。一旦显式写 name（例如 lingxi-mysql-data），compose 会指向另一份空卷，
+  # 表现就是「库表全没了」——其实只是挂错了卷。
+  lingxi-mysql-data:
+  lingxi-redis-data:
+  # 应用日志（logback 的 ./logs），容器重建后历史日志仍在
+  lingxi-app-logs:

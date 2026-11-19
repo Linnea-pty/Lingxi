@@ -1,0 +1,12 @@
+# 构建上下文排除项：镜像里只需要 pom.xml 与 src，其余既无用也可能泄密
+target/
+logs/
+.git/
+.idea/
+.vscode/
+.codebuddy/
+docs/
+*.md
+# 本地密钥与密码：绝不进构建上下文（进不去的镜像自然也泄露不了）
+.env
+.jwt-secret

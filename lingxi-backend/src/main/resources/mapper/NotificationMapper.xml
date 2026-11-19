@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.linnea.lingxi.mapper.NotificationMapper">
+
+    <!--
+      通知出参列：联表取触发者的昵称与头像，避免前端拿到 actorId 后再逐条查用户（N+1）。
+      触发者已注销时整行不出现——点进去必然是空主页，展示无意义。
+    -->
+    <sql id="notificationColumns">
+        n.id                       AS notification_id,
+        n.type                     AS type,
+        n.actor_id                 AS actor_id,
+        u.username                 AS actor_username,
+        u.nickname                 AS actor_nickname,
+        COALESCE(u.avatar_url, '') AS actor_avatar_url,
+        n.target_id                AS target_id,
+        n.post_id                  AS post_id,
+        n.is_read                  AS is_read,
+        n.create_time              AS create_time
+    </sql>
+
+    <!--
+      通知列表：接收者维度 + 可选未读过滤 + 键集游标。
+      游标条件是「时间更早」或「时间相同但ID更小」，与 ORDER BY (create_time DESC, id DESC) 严格对齐，
+      保证同一秒内产生的多条通知既能翻全、也不会重复。
+    -->
+    <select id="selectNotificationList" resultType="com.linnea.lingxi.vo.NotificationVO">
+        SELECT
+        <include refid="notificationColumns"/>
+        FROM notification n
+        INNER JOIN `user` u ON u.id = n.actor_id AND u.is_deleted = 0
+        WHERE n.user_id = #{userId}
+        <if test="unreadOnly">
+            AND n.is_read = 0
+        </if>
+        <if test="cursorCreateTime != null and cursorId != null">
+            AND (n.create_time &lt; #{cursorCreateTime}
+            OR (n.create_time = #{cursorCreateTime} AND n.id &lt; #{cursorId}))
+        </if>
+        ORDER BY n.create_time DESC, n.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 未读数：命中 idx_user_read_time 的前两列，不回表 -->
+    <select id="countUnread" resultType="long">
+        SELECT COUNT(*)
+        FROM notification
+        WHERE user_id = #{userId}
+          AND is_read = 0
+    </select>
+
+    <!-- 单条已读：WHERE 带 user_id 防越权；带 is_read = 0 让「重复标记」返回 0 行而非假成功 -->
+    <update id="markRead">
+        UPDATE notification
+        SET is_read = 1
+        WHERE id = #{notificationId}
+          AND user_id = #{userId}
+          AND is_read = 0
+    </update>
+
+    <!-- 全部已读：只动未读行，避免无谓写入 -->
+    <update id="markAllRead">
+        UPDATE notification
+        SET is_read = 1
+        WHERE user_id = #{userId}
+          AND is_read = 0
+    </update>
+
+</mapper>

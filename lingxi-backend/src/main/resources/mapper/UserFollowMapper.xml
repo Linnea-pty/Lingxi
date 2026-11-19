@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  用户关注关系自定义 SQL。
+  索引对齐：idx_following_time(user_id, status, follow_time, id) 与 idx_follower_time(follow_user_id, status, follow_time, id)
+  都是「等值列在前、排序列在后」，游标条件与 ORDER BY 共用同一索引，深翻页不必 filesort。
+-->
+<mapper namespace="com.linnea.lingxi.mapper.UserFollowMapper">
+
+    <!--
+      建立/恢复关注关系。
+      ON DUPLICATE KEY UPDATE 命中 uk_user_follow(user_id, follow_user_id)：
+      已关注时重复调用只刷新 follow_time，取关后再次关注把 status 改回 1，两种情况都是幂等成功。
+    -->
+    <insert id="upsertFollow">
+        INSERT INTO user_follow (user_id, follow_user_id, status, follow_time)
+        VALUES (#{userId}, #{followUserId}, 1, NOW())
+        ON DUPLICATE KEY UPDATE status = 1,
+                                follow_time = NOW()
+    </insert>
+
+    <!--
+      取关：只更新当前有效的关系行。
+      WHERE 限定 status = 1，重复取关影响 0 行而不报错，前端可无脑重试。
+    -->
+    <update id="cancelFollow">
+        UPDATE user_follow
+        SET status = 0
+        WHERE user_id = #{userId}
+          AND follow_user_id = #{followUserId}
+          AND status = 1
+    </update>
+
+    <!--
+      关注列表：user_id 等值 + status 等值 + (follow_time, id) 倒序，命中 idx_following_time。
+      JOIN user 带 is_deleted = 0：注销账号不再出现在列表里；计数口径独立统计，两者刻意分开。
+    -->
+    <select id="selectFollowingList" resultType="com.linnea.lingxi.vo.FollowUserVO">
+        SELECT
+            f.id                      AS follow_id,
+            f.follow_user_id           AS user_id,
+            u.username                AS username,
+            u.nickname                AS nickname,
+            COALESCE(u.avatar_url, '') AS avatar_url,
+            f.follow_time             AS followed_at
+        FROM user_follow f
+        INNER JOIN `user` u ON u.id = f.follow_user_id AND u.is_deleted = 0
+        <where>
+            f.user_id = #{userId}
+            AND f.status = 1
+            <if test="cursorFollowTime != null and cursorId != null">
+                AND (
+                    f.follow_time &lt; #{cursorFollowTime}
+                    OR (f.follow_time = #{cursorFollowTime} AND f.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY f.follow_time DESC, f.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      粉丝列表：follow_user_id 等值 + status 等值 + (follow_time, id) 倒序，命中 idx_follower_time。
+      输出的是关注发起方（粉丝）的资料。
+    -->
+    <select id="selectFollowerList" resultType="com.linnea.lingxi.vo.FollowUserVO">
+        SELECT
+            f.id                      AS follow_id,
+            f.user_id                  AS user_id,
+            u.username                AS username,
+            u.nickname                AS nickname,
+            COALESCE(u.avatar_url, '') AS avatar_url,
+            f.follow_time             AS followed_at
+        FROM user_follow f
+        INNER JOIN `user` u ON u.id = f.user_id AND u.is_deleted = 0
+        <where>
+            f.follow_user_id = #{followUserId}
+            AND f.status = 1
+            <if test="cursorFollowTime != null and cursorId != null">
+                AND (
+                    f.follow_time &lt; #{cursorFollowTime}
+                    OR (f.follow_time = #{cursorFollowTime} AND f.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY f.follow_time DESC, f.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      批量判断「我是否已关注本页这些人」。
+      IN 列表长度由调用方保证 ≤ 30（等于列表分页上限），不会出现超大 IN。
+    -->
+    <select id="selectFollowingIdList" resultType="java.lang.Long">
+        SELECT f.follow_user_id
+        FROM user_follow f
+        WHERE f.user_id = #{userId}
+          AND f.status = 1
+          AND f.follow_user_id IN
+        <foreach collection="targetUserIdList" item="targetUserId" open="(" separator="," close=")">
+            #{targetUserId}
+        </foreach>
+    </select>
+
+    <!-- 关注数：user_id + status 等值，命中 idx_following_time 前缀。 -->
+    <select id="countFollowing" resultType="long">
+        SELECT COUNT(*)
+        FROM user_follow
+        WHERE user_id = #{userId}
+          AND status = 1
+    </select>
+
+    <!-- 粉丝数：follow_user_id + status 等值，命中 idx_follower_time 前缀。 -->
+    <select id="countFollower" resultType="long">
+        SELECT COUNT(*)
+        FROM user_follow
+        WHERE follow_user_id = #{followUserId}
+          AND status = 1
+    </select>
+
+</mapper>

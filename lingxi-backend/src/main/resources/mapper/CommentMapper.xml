@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  评论表自定义 SQL。
+  约定：
+  1. 只放 BaseMapper/LambdaQueryWrapper 表达不了的查询（联表取昵称、键集分页、分组统计）；
+  2. 自定义 SQL 不会被 @TableLogic 自动改写，逻辑删除条件必须手写；
+  3. 游标条件写成嵌套 OR 而非行值比较，行值比较在 MySQL 8 上只能走 index 全扫（见 PostMapper.xml 同处说明）。
+-->
+<mapper namespace="com.linnea.lingxi.mapper.CommentMapper">
+
+    <!--
+      评论列清单：评论字段 + 作者字段 + 被回复人昵称。
+      author_id 取 c.user_id 而不是 u.id：作者注销后 join 不命中，但评论归属仍需可追溯。
+      昵称与头像统一 COALESCE 成空串：reply_user_id 为 0 时 ru 不命中，作者注销或昵称为空时 u.nickname 为空。
+    -->
+    <sql id="commentColumns">
+        c.id            AS comment_id,
+        c.post_id       AS post_id,
+        c.parent_id     AS parent_id,
+        c.root_id       AS root_id,
+        c.content       AS content,
+        c.create_time   AS create_time,
+        c.user_id       AS author_id,
+        COALESCE(u.nickname, '')   AS author_nickname,
+        COALESCE(u.avatar_url, '') AS author_avatar_url,
+        c.reply_user_id AS reply_user_id,
+        COALESCE(ru.nickname, '')  AS reply_user_nickname
+    </sql>
+
+    <!-- 一级评论列表：命中 idx_post_time(post_id, create_time, id)，倒序 + 键集游标 -->
+    <select id="selectRootCommentList" resultType="com.linnea.lingxi.vo.CommentVO">
+        SELECT
+        <include refid="commentColumns"/>
+        FROM comment c
+        LEFT JOIN `user` u ON u.id = c.user_id AND u.is_deleted = 0
+        LEFT JOIN `user` ru ON ru.id = c.reply_user_id AND ru.is_deleted = 0
+        <where>
+            c.post_id = #{postId}
+            AND c.is_deleted = 0
+            AND c.parent_id = 0
+            <if test="cursorId != null">
+                AND (
+                    c.create_time &lt; #{cursorCreateTime}
+                    OR (c.create_time = #{cursorCreateTime} AND c.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY c.create_time DESC, c.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      讨论串回复列表：命中 idx_root_time(root_id, create_time, id)，正序排列符合「从上往下读」的对话顺序。
+      条件用 parent_id &lt;&gt; 0 排除根评论自身，与一级评论列表互补、不重不漏。
+    -->
+    <select id="selectReplyList" resultType="com.linnea.lingxi.vo.CommentVO">
+        SELECT
+        <include refid="commentColumns"/>
+        FROM comment c
+        LEFT JOIN `user` u ON u.id = c.user_id AND u.is_deleted = 0
+        LEFT JOIN `user` ru ON ru.id = c.reply_user_id AND ru.is_deleted = 0
+        <where>
+            c.root_id = #{rootCommentId}
+            AND c.is_deleted = 0
+            AND c.parent_id &lt;&gt; 0
+            <if test="cursorId != null">
+                AND (
+                    c.create_time &gt; #{cursorCreateTime}
+                    OR (c.create_time = #{cursorCreateTime} AND c.id &gt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY c.create_time ASC, c.id ASC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 批量统计回复数：一次 GROUP BY 取回当前页所有根评论的回复数，避免逐条查询 -->
+    <select id="selectReplyCountList" resultType="com.linnea.lingxi.vo.CommentReplyCountVO">
+        SELECT
+            c.root_id AS root_id,
+            COUNT(*)  AS reply_count
+        FROM comment c
+        WHERE c.root_id IN
+        <foreach collection="rootIdList" item="rootId" open="(" separator="," close=")">
+            #{rootId}
+        </foreach>
+          AND c.parent_id &lt;&gt; 0
+          AND c.is_deleted = 0
+        GROUP BY c.root_id
+    </select>
+
+    <!--
+      我的评论：按创建时间倒序，索引 idx_user_time(user_id, is_deleted, create_time, id) 对齐。
+      INNER JOIN post 过滤掉所属动态已删除的评论：这类评论点进去必然 404，不应出现在列表里。
+      作者/被回复人联表口径与一级评论列表完全一致，便于前端复用同一套渲染。
+    -->
+    <select id="selectUserCommentList" resultType="com.linnea.lingxi.vo.CommentVO">
+        SELECT
+        <include refid="commentColumns"/>
+        FROM comment c
+        INNER JOIN post p ON p.id = c.post_id AND p.is_deleted = 0
+        LEFT JOIN `user` u ON u.id = c.user_id AND u.is_deleted = 0
+        LEFT JOIN `user` ru ON ru.id = c.reply_user_id AND ru.is_deleted = 0
+        <where>
+            c.user_id = #{userId}
+            AND c.is_deleted = 0
+            <if test="cursorId != null">
+                AND (
+                    c.create_time &lt; #{cursorCreateTime}
+                    OR (c.create_time = #{cursorCreateTime} AND c.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY c.create_time DESC, c.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      递归取评论子树：删除一条评论时把它和挂在它下面的回复一起标记删除。
+      WHY 递归而不是只删自身：回复平铺存储，删除父评论后子回复会成为孤儿——
+      parent_id 指向已删评论，一级评论列表（parent_id = 0）看不到，回复列表却仍返回，
+      形成「串里有回复、串头已消失」的脏数据。
+      递归项带 is_deleted = 0：已删除的分支不再向下展开，避免重复收集。
+    -->
+    <select id="selectDescendantIdList" resultType="java.lang.Long">
+        WITH RECURSIVE comment_tree AS (
+            SELECT c.id, c.parent_id
+            FROM comment c
+            WHERE c.id = #{commentId}
+              AND c.is_deleted = 0
+            UNION ALL
+            SELECT c.id, c.parent_id
+            FROM comment c
+            INNER JOIN comment_tree ct ON c.parent_id = ct.id
+            WHERE c.is_deleted = 0
+        )
+        SELECT id FROM comment_tree
+    </select>
+
+    <!-- 批量逻辑删除：is_deleted 与 update_time 必须手写（自定义 SQL 不走 @TableLogic） -->
+    <update id="softDeleteByIdList">
+        UPDATE comment
+        SET is_deleted = 1,
+            update_time = NOW()
+        WHERE is_deleted = 0
+          AND id IN
+        <foreach collection="commentIdList" item="commentId" open="(" separator="," close=")">
+            #{commentId}
+        </foreach>
+    </update>
+
+    <!-- 删动态时级联删除其全部评论：带 post_id 条件，避免无 WHERE 的全表更新 -->
+    <update id="softDeleteByPostId">
+        UPDATE comment
+        SET is_deleted = 1,
+            update_time = NOW()
+        WHERE post_id = #{postId}
+          AND is_deleted = 0
+    </update>
+</mapper>

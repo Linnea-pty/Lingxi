@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  动态表自定义 SQL。
+  约定：
+  1. 只放 BaseMapper/LambdaQueryWrapper 表达不了的查询（本文件为联表 + 组合游标过滤 + 显式 LIMIT + 批量计数）；
+  2. 自定义 SQL 不会被 @TableLogic 自动改写，逻辑删除条件必须手写；
+  3. 列名一律写全，禁止 SELECT *。
+-->
+<mapper namespace="com.linnea.lingxi.mapper.PostMapper">
+
+    <!--
+      信息流列清单：动态字段 + 作者字段。
+      作者信息在此扁平化输出（author_* 别名经下划线转驼峰映射到 PostVO 的同名字段），
+      省掉 list 内逐条查作者的 N+1 查询。
+    -->
+    <sql id="feedColumns">
+        p.id          AS post_id,
+        p.content     AS content,
+        p.source      AS source,
+        p.is_pinned   AS is_pinned,
+        p.create_time AS create_time,
+        u.id          AS author_id,
+        u.nickname    AS author_nickname,
+        u.avatar_url  AS author_avatar_url
+    </sql>
+
+    <!--
+      信息流键集分页：按 (is_pinned, create_time, id) 三列倒序，与复合索引 idx_feed_cursor 完全对齐。
+      游标条件展开成三段 OR，表达「排在上一页最后一行之后」的字典序语义：
+        is_pinned 更小 → 全部命中；is_pinned 相同且时间更早 → 命中；前两列相同且 ID 更小 → 命中。
+      WHY 不用行值比较 (a,b,c) < (?,?,?)：实测该写法在 5000 行数据上 type=index（倒退全索引扫描），
+      而嵌套 OR 能走 type=range，深翻页才不会退化成扫描；键集分页的意义正在于此。
+      首页不带游标则只按排序取前 N 行。
+      LEFT JOIN：作者已注销时动态仍需展示，作者列为 null 由上层兜底成占位昵称。
+    -->
+    <select id="selectFeedList" resultType="com.linnea.lingxi.vo.PostVO">
+        SELECT
+        <include refid="feedColumns"/>
+        FROM post p
+        LEFT JOIN `user` u ON u.id = p.user_id AND u.is_deleted = 0
+        <where>
+            p.is_deleted = 0
+            <if test="cursorId != null">
+                AND (
+                    p.is_pinned &lt; #{cursorPinned}
+                    OR (p.is_pinned = #{cursorPinned} AND p.create_time &lt; #{cursorCreateTime})
+                    OR (p.is_pinned = #{cursorPinned} AND p.create_time = #{cursorCreateTime}
+                        AND p.id &lt; #{cursorId})
+                )
+            </if>
+        </where>
+        ORDER BY p.is_pinned DESC, p.create_time DESC, p.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      批量统计互动计数：一次 IN + 两个标量子查询，子查询各自命中 idx_post_id。
+      WHY 不用 LEFT JOIN 聚合子查询：那会把 post_like/comment 的全部分组先物化再与本页结果 join，
+      数据量上来后退化为全表聚合；IN 只触达本页 ≤30 个 post_id，代价可控。
+      为什么也不加冗余计数列：见 PostServiceImpl#fillInteractionCount 的类注释说明。
+      自定义 SQL 不带 @TableLogic 过滤，点赞与评论的逻辑删除条件手写。
+      l.status = 1：只统计有效点赞，取消点赞保留行但状态为 0。
+    -->
+    <select id="selectPostCountList" resultType="com.linnea.lingxi.vo.PostInteractionCountVO">
+        SELECT
+            p.id AS post_id,
+            (SELECT COUNT(*) FROM post_like l
+              WHERE l.post_id = p.id AND l.status = 1 AND l.deleted_id = 0) AS like_count,
+            (SELECT COUNT(*) FROM comment c
+              WHERE c.post_id = p.id AND c.is_deleted = 0) AS comment_count
+        FROM post p
+        WHERE p.id IN
+        <foreach collection="postIdList" item="postId" open="(" separator="," close=")">
+            #{postId}
+        </foreach>
+    </select>
+
+    <!--
+      我赞过的动态：从 post_like 驱动，按点赞时间倒序。
+      索引 idx_user_active_time(user_id, status, deleted_id, create_time, id) 覆盖全部过滤与排序条件。
+      INNER JOIN post 且带 p.is_deleted = 0：动态被删后不再出现在「我赞过的」里；
+      点赞行本身保留（不物理删），所以这里靠 JOIN 过滤而不是清理数据。
+      游标用点赞记录的 (create_time, id)，不用动态的发布时间——排序键必须与游标列一致。
+    -->
+    <select id="selectLikedPostList" resultType="com.linnea.lingxi.vo.PostVO">
+        SELECT
+        <include refid="feedColumns"/>,
+        l.create_time AS liked_at
+        FROM post_like l
+        INNER JOIN post p ON p.id = l.post_id AND p.is_deleted = 0
+        LEFT JOIN `user` u ON u.id = p.user_id AND u.is_deleted = 0
+        <where>
+            l.user_id = #{userId}
+            AND l.status = 1
+            AND l.deleted_id = 0
+            <if test="cursorPostId != null">
+                AND (
+                    l.create_time &lt; #{cursorCreateTime}
+                    OR (l.create_time = #{cursorCreateTime} AND l.post_id &lt; #{cursorPostId})
+                )
+            </if>
+        </where>
+        ORDER BY l.create_time DESC, l.post_id DESC
+        LIMIT #{limit}
+    </select>
+</mapper>
